@@ -3,6 +3,7 @@
 import json
 import time
 import subprocess
+import logging
 import threading
 from datetime import datetime
 
@@ -11,10 +12,14 @@ from flask import Flask, Response, render_template, jsonify
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# Configure logging
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Global state for network speed calculation
+# ---------------------------------------------------------------------------
+_net_lock = threading.Lock()
 _net_prev = psutil.net_io_counters(pernic=True)
 _net_prev_ts = time.time()
 
@@ -22,7 +27,8 @@ _net_prev_ts = time.time()
 def _cpu_info():
     """CPU usage, frequency, temperature, per-core info."""
     freq = psutil.cpu_freq(percpu=True) or []
-    usage_per = psutil.cpu_percent(interval=0.5, percpu=True)
+    # Non-blocking: interval=0 returns instantaneous usage
+    usage_per = psutil.cpu_percent(interval=0, percpu=True)
     load1, load5, load15 = psutil.getloadavg()
 
     # Try to get temperature from thermal zones
@@ -48,11 +54,20 @@ def _cpu_info():
     except Exception:
         pass
 
+    # usage_total: need two calls with small delay for accurate reading
+    # First call primes the counter, second call gets real value
+    try:
+        psutil.cpu_percent(interval=None)
+        time.sleep(0.05)
+        usage_total = psutil.cpu_percent(interval=None)
+    except Exception:
+        usage_total = 0
+
     return {
         "model": model,
         "physical_cores": psutil.cpu_count(logical=False) or 0,
         "logical_cores": psutil.cpu_count(logical=True) or 0,
-        "usage_total": psutil.cpu_percent(),
+        "usage_total": usage_total,
         "usage_per_core": usage_per,
         "frequency": [{"current": f.current, "min": f.min, "max": f.max} for f in freq],
         "load_avg": {"1m": round(load1, 2), "5m": round(load5, 2), "15m": round(load15, 2)},
@@ -82,36 +97,41 @@ def _network_info():
     global _net_prev, _net_prev_ts
     current = psutil.net_io_counters(pernic=True)
     now = time.time()
-    dt = now - _net_prev_ts if _net_prev_ts else 1
 
-    interfaces = {}
-    for nic, counters in current.items():
-        prev = _net_prev.get(nic)
-        if prev:
-            interfaces[nic] = {
-                "bytes_sent": counters.bytes_sent,
-                "bytes_recv": counters.bytes_recv,
-                "speed_sent": (counters.bytes_sent - prev.bytes_sent) / dt,
-                "speed_recv": (counters.bytes_recv - prev.bytes_recv) / dt,
-                "packets_sent": counters.packets_sent,
-                "packets_recv": counters.packets_recv,
-                "errin": counters.errin,
-                "errout": counters.errout,
-            }
-        else:
-            interfaces[nic] = {
-                "bytes_sent": counters.bytes_sent,
-                "bytes_recv": counters.bytes_recv,
-                "speed_sent": 0,
-                "speed_recv": 0,
-                "packets_sent": counters.packets_sent,
-                "packets_recv": counters.packets_recv,
-                "errin": counters.errin,
-                "errout": counters.errout,
-            }
+    with _net_lock:
+        dt = now - _net_prev_ts
+        # Cap dt to avoid huge speeds on first request after long idle
+        if dt <= 0 or dt > 60:
+            dt = 2.0
 
-    _net_prev = current
-    _net_prev_ts = now
+        interfaces = {}
+        for nic, counters in current.items():
+            prev = _net_prev.get(nic)
+            if prev:
+                interfaces[nic] = {
+                    "bytes_sent": counters.bytes_sent,
+                    "bytes_recv": counters.bytes_recv,
+                    "speed_sent": (counters.bytes_sent - prev.bytes_sent) / dt,
+                    "speed_recv": (counters.bytes_recv - prev.bytes_recv) / dt,
+                    "packets_sent": counters.packets_sent,
+                    "packets_recv": counters.packets_recv,
+                    "errin": counters.errin,
+                    "errout": counters.errout,
+                }
+            else:
+                interfaces[nic] = {
+                    "bytes_sent": counters.bytes_sent,
+                    "bytes_recv": counters.bytes_recv,
+                    "speed_sent": 0,
+                    "speed_recv": 0,
+                    "packets_sent": counters.packets_sent,
+                    "packets_recv": counters.packets_recv,
+                    "errin": counters.errin,
+                    "errout": counters.errout,
+                }
+
+        _net_prev = current
+        _net_prev_ts = now
 
     total = psutil.net_io_counters()
     # Addrs
@@ -195,6 +215,11 @@ def _disk_info():
 def _process_list():
     """Top processes by CPU usage."""
     procs = []
+    # First call cpu_percent to prime the counter
+    try:
+        psutil.cpu_percent(interval=None)
+    except Exception:
+        pass
     for p in psutil.process_iter(["pid", "name", "username", "cpu_percent", "memory_percent", "create_time"]):
         try:
             info = p.info
@@ -266,7 +291,11 @@ def index():
 
 @app.route("/api/data")
 def api_data():
-    return jsonify(_collect_all())
+    try:
+        return jsonify(_collect_all())
+    except Exception as e:
+        logger.error("Error collecting data: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/stream")
@@ -274,8 +303,12 @@ def api_stream():
     """SSE endpoint — pushes full data every 2 seconds."""
     def generate():
         while True:
-            data = _collect_all()
-            yield f"data: {json.dumps(data)}\n\n"
+            try:
+                data = _collect_all()
+                yield f"data: {json.dumps(data)}\n\n"
+            except Exception as e:
+                logger.error("Error in SSE stream: %s", e)
+                yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
             time.sleep(2)
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -283,27 +316,47 @@ def api_stream():
 
 @app.route("/api/cpu")
 def api_cpu():
-    return jsonify(_cpu_info())
+    try:
+        return jsonify(_cpu_info())
+    except Exception as e:
+        logger.error("Error getting CPU info: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/memory")
 def api_memory():
-    return jsonify(_memory_info())
+    try:
+        return jsonify(_memory_info())
+    except Exception as e:
+        logger.error("Error getting memory info: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/network")
 def api_network():
-    return jsonify(_network_info())
+    try:
+        return jsonify(_network_info())
+    except Exception as e:
+        logger.error("Error getting network info: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/disk")
 def api_disk():
-    return jsonify(_disk_info())
+    try:
+        return jsonify(_disk_info())
+    except Exception as e:
+        logger.error("Error getting disk info: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/processes")
 def api_processes():
-    return jsonify(_process_list())
+    try:
+        return jsonify(_process_list())
+    except Exception as e:
+        logger.error("Error getting process list: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------
@@ -311,9 +364,6 @@ def api_processes():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Trigger one reading so the first SSE frame has a delta
-    psutil.cpu_percent(interval=0, percpu=True)
-    psutil.net_io_counters(pernic=True)
-    time.sleep(0.3)
-
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    # Allow configurable port
+    port = int(__import__("os").environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)

@@ -3,6 +3,15 @@
     "use strict";
 
     // ── Helpers ──────────────────────────────────────────────────────
+    function escapeHtml(str) {
+        if (str == null) return "";
+        return String(str)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
     function fmtBytes(b) {
         if (b === 0) return "0 B";
         var u = ["B", "KB", "MB", "GB", "TB"];
@@ -119,7 +128,7 @@
         for (var tk in temps) {
             temps[tk].forEach(function (t) {
                 var val = t.current != null ? t.current.toFixed(1) + "°C" : "N/A";
-                tempHtml += '<span class="temp-badge">🌡 ' + (t.label || tk) + ": " + val + "</span>";
+                tempHtml += '<span class="temp-badge">🌡 ' + escapeHtml(t.label || tk) + ": " + val + "</span>";
             });
         }
         document.getElementById("cpuTemp").innerHTML = tempHtml;
@@ -143,10 +152,7 @@
         document.getElementById("memCached").textContent = fmtBytes(mem.cached || 0);
         document.getElementById("memSwap").textContent = fmtBytes(mem.swap_used || 0) + " / " + fmtBytes(mem.swap_total || 0) + " (" + (mem.swap_percent || 0).toFixed(1) + "%)";
 
-        // Network
-        var net = d.network || {};
-        document.getElementById("netUp").textContent = fmtSpeed(0);
-        document.getElementById("netDown").textContent = fmtSpeed(0);
+        // Network — remove initial zero display to avoid flicker
         var ifaces = net.interfaces || {};
         var totalUp = 0, totalDown = 0;
         for (var nic in ifaces) {
@@ -170,7 +176,7 @@
         for (var n in ifaces) {
             if (n.indexOf("lo") === 0) continue;
             nicHtml += '<div class="iface-item">';
-            nicHtml += '<div class="iface-name">' + n + "</div>";
+            nicHtml += '<div class="iface-name">' + escapeHtml(n) + "</div>";
             nicHtml += '<div>↑ ' + fmtSpeed(ifaces[n].speed_sent) + " &nbsp; ↓ " + fmtSpeed(ifaces[n].speed_recv) + "</div>";
             nicHtml += "</div>";
         }
@@ -182,8 +188,8 @@
         (disk.disks || []).forEach(function (dk) {
             var smartText = dk.name in (disk.smart || {}) ? (disk.smart[dk.name] === true ? "✅ 健康" : disk.smart[dk.name] === false ? "⚠️ 警告" : "❓ 未知") : "";
             disksHtml += '<div class="disk-item">';
-            disksHtml += '<div class="disk-name">💿 ' + dk.name + " — " + dk.model + "</div>";
-            disksHtml += '<div class="disk-meta">' + dk.type + " | " + dk.size + " | " + dk.transport + " | " + smartText + "</div>";
+            disksHtml += '<div class="disk-name">💿 ' + escapeHtml(dk.name) + " — " + escapeHtml(dk.model) + "</div>";
+            disksHtml += '<div class="disk-meta">' + escapeHtml(dk.type) + " | " + escapeHtml(dk.size) + " | " + escapeHtml(dk.transport) + " | " + smartText + "</div>";
             disksHtml += "</div>";
         });
         document.getElementById("diskPhysical").innerHTML = disksHtml;
@@ -192,7 +198,7 @@
         (disk.partitions || []).forEach(function (p) {
             var col = partColor(p.percent);
             partHtml += '<div class="part-row">';
-            partHtml += '<div class="info-row"><span>' + p.mountpoint + " (" + p.device + ')</span><span>' + fmtBytes(p.used) + " / " + fmtBytes(p.total) + " (" + p.percent.toFixed(1) + "%)</span></div>";
+            partHtml += '<div class="info-row"><span>' + escapeHtml(p.mountpoint) + " (" + escapeHtml(p.device) + ')</span><span>' + fmtBytes(p.used) + " / " + fmtBytes(p.total) + " (" + p.percent.toFixed(1) + "%)</span></div>";
             partHtml += '<div class="part-bar-bg"><div class="part-bar" style="width:' + p.percent + "%;background:" + col + '"></div></div>';
             partHtml += "</div>";
         });
@@ -203,12 +209,12 @@
         var procHtml = "";
         procs.slice(0, 20).forEach(function (p) {
             procHtml += "<tr>";
-            procHtml += "<td>" + p.pid + "</td>";
-            procHtml += "<td>" + p.name + "</td>";
-            procHtml += "<td>" + p.user + "</td>";
+            procHtml += "<td>" + escapeHtml(String(p.pid)) + "</td>";
+            procHtml += "<td>" + escapeHtml(p.name) + "</td>";
+            procHtml += "<td>" + escapeHtml(p.user) + "</td>";
             procHtml += "<td>" + cpuBadge(p.cpu) + "</td>";
             procHtml += "<td>" + p.mem.toFixed(1) + "</td>";
-            procHtml += "<td>" + p.started + "</td>";
+            procHtml += "<td>" + escapeHtml(p.started) + "</td>";
             procHtml += "</tr>";
         });
         document.getElementById("procList").innerHTML = procHtml;
